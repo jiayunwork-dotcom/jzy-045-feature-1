@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enzyme-kinetics-api"
+version = "1.0.0"
+description = "HTTP endpoint for Michaelis-Menten rates and competitive inhibition"
+requires-python = ">=3.12"
+dependencies = [
+    "Flask==3.1.3",
+    "gunicorn==23.0.0",
+]
+
+[tool.setuptools]
+py-modules = ["wsgi"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,14 @@
+services:
+  enzyme-api:
+    build: .
+    image: enzyme-kinetics-api:1.0.0
+    ports:
+      - "8000:8000"
+    environment:
+      ENZYME_STORE_PATH: /data/enzymes.json
+    volumes:
+      - enzyme-data:/data
+    restart: unless-stopped
+
+volumes:
+  enzyme-data:
