@@ -6,10 +6,19 @@ from flask import Blueprint, current_app, jsonify, request
 
 from .enzyme_store import EnzymeNotFoundError, EnzymeProfile
 from .errors import json_error
+from .fitting import (
+    DEFAULT_MAX_ITERATIONS,
+    FitConvergenceError,
+    InsufficientDataError,
+    UnidentifiableDataError,
+    compare_with_profile,
+    fit_michaelis_menten,
+)
 from .inhibition import competitive_rate
 from .kinetics import michaelis_rate
 from .validation import (
     ValidationError,
+    parse_fit_request,
     parse_inhibited_rate_request,
     parse_profile_payload,
     parse_rate_request,
@@ -106,6 +115,106 @@ def calculate_inhibited_rate():
     }
     if enzyme is not None:
         body["enzyme"] = enzyme
+    return jsonify(body)
+
+
+# ----------------------------------------------------------------- fitting
+_FIT_WARNING_MESSAGES = {
+    "narrow_substrate_range": (
+        "substrate concentrations span less than one order of magnitude; "
+        "Vmax and Km may be poorly separated"
+    ),
+    "no_saturation_observed": (
+        "no measurement approaches Vmax (highest rate below half the fitted "
+        "Vmax); the estimate is an extrapolation"
+    ),
+    "weak_parameter_identifiability": (
+        "Vmax and Km are strongly correlated along these points; treat the "
+        "individual constants with caution"
+    ),
+    "outlier_residual": (
+        "at least one point deviates from the fitted curve by more than "
+        "three regression standard errors"
+    ),
+    "poor_fit": (
+        "the Michaelis-Menten curve explains less than 80% of the rate "
+        "variance (R^2 < 0.8)"
+    ),
+}
+
+
+def _fit_payload(result, initial: dict | None = None) -> dict[str, object]:
+    body: dict[str, object] = {
+        "vmax": result.vmax,
+        "km": result.km,
+        "converged": True,
+        "iterations": result.iterations,
+        "n_points": result.n_points,
+        "well_identified": result.well_identified,
+        "reliable": result.reliable,
+        "warnings": [
+            {"code": code, "message": _FIT_WARNING_MESSAGES.get(code, code)}
+            for code in result.warnings
+        ],
+        "goodness_of_fit": {
+            "r_squared": result.r_squared,
+            "sse": result.sse,
+            "rmse": result.rmse,
+            "residual_standard_error": result.residual_std_error,
+            "max_abs_residual": result.max_abs_residual,
+            "identifiability_collinearity": result.collinearity,
+        },
+    }
+    if initial is not None:
+        body["initial_guess"] = initial
+    return body
+
+
+@api.post("/rate/fit")
+def fit_constants():
+    """Fit Vmax/Km from ([S], observed v) scatter (nonlinear least squares).
+
+    Body: {"measurements": [{"substrate": s, "observed_rate": v}, ...],
+           optional "enzyme": <registered name>,
+           optional "max_iterations": int}.
+    """
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return json_error(400, "bad_request", "request body must be valid JSON")
+    try:
+        req = parse_fit_request(payload)
+        profile = None
+        if "enzyme" in req:
+            profile = _store().get(req["enzyme"])
+        result = fit_michaelis_menten(
+            ((m["substrate"], m["observed_rate"]) for m in req["measurements"]),
+            max_iterations=req.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+        )
+    except ValidationError as exc:
+        return json_error(400, "validation_error", str(exc))
+    except EnzymeNotFoundError as exc:
+        return json_error(404, "enzyme_not_found",
+                          f"no enzyme registered as {exc.args[0]!r}")
+    except InsufficientDataError as exc:
+        return json_error(422, "insufficient_data", str(exc))
+    except UnidentifiableDataError as exc:
+        return json_error(422, "fit_unidentifiable", str(exc))
+    except FitConvergenceError as exc:
+        return json_error(422, "fit_did_not_converge", str(exc))
+
+    body = _fit_payload(
+        result,
+        initial={"vmax": result.initial_vmax, "km": result.initial_km},
+    )
+    if profile is not None:
+        body["enzyme"] = req["enzyme"]
+        body["comparison"] = compare_with_profile(
+            enzyme=req["enzyme"],
+            registered_vmax=profile.vmax,
+            registered_km=profile.km,
+            fitted_vmax=result.vmax,
+            fitted_km=result.km,
+        ).to_json()
     return jsonify(body)
 
 

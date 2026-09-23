@@ -37,14 +37,16 @@ Lineweaver–Burk 不变量（端点返回 `lineweaver_burk.slope/y_intercept` �
 ```
 app/
   __init__.py       # Flask 应用工厂（错误处理器、蓝图装配）
-  kinetics.py       # 米氏速率核心（纯函数、无状态）
+  kinetics.py       # 正向：米氏速率核心（纯函数、无状态）
+  fitting.py        # 反向：由 ([S], v) 散点非线性最小二乘拟合 Vmax/Km
+                    #       （手写多起点 Levenberg–Marquardt，显式收敛判据）
   inhibition.py     # 竞争性抑制换算（Km_app / Vmax_app / LB 系数）
   validation.py     # 入参校验（非法/矛盾输入、未知字段拒绝）
   enzyme_store.py   # 酶参数档持久化（JSON + fcntl 跨进程锁 + 原子替换）
   routes.py         # HTTP 路由
   errors.py         # 统一 JSON 错误响应
 wsgi.py             # gunicorn 入口（wsgi:app）
-tests/              # 106 条自动化测试（不变量/非法输入/并发/重启持久化）
+tests/              # 179 条自动化测试（不变量/非法输入/并发/重启持久化/拟合回归护栏）
 Dockerfile          # python:3.12-slim，非 root 用户，/data 卷，HEALTHCHECK
 docker-compose.yml
 ```
@@ -97,7 +99,60 @@ curl -XPOST localhost:8000/v1/rate/inhibited -H 'Content-Type: application/json'
 # {"rate":50.0,"alpha":2.0,"apparent":{"km":0.2,"vmax":100.0}, ...}
 ```
 
-### 3. 酶参数档管理（落地保存、重启后保留）
+### 3. 由实测散点反推动力学常数 `POST /v1/rate/fit`
+
+反向端点：提交若干 `(substrate, observed_rate)` 测量对，在无抑制米氏方程
+假设下做**非线性最小二乘**（米氏方程对 Vmax 线性、对 Km 非线性，不能套线性
+回归），求残差平方和最小的 `Vmax`/`Km`。求解器是从零实现的多起点
+Levenberg–Marquardt（对数参数空间阻尼 Gauss–Newton，依赖清单之外**不引入**
+任何数值库），收敛判据（步长 / 目标函数相对下降 / 平稳梯度三者满足其一）
+与迭代上限均显式给出，没收敛绝不吐出中间结果。
+
+```bash
+curl -XPOST localhost:8000/v1/rate/fit -H 'Content-Type: application/json' \
+  -d '{"measurements":[
+        {"substrate":0.01,"observed_rate":9.0},
+        {"substrate":0.1,"observed_rate":50.3},
+        {"substrate":1.0,"observed_rate":90.7}],
+       "max_iterations":100}'
+# {"vmax":...,"km":...,"converged":true,"iterations":4,"n_points":10,
+#  "reliable":true,"well_identified":true,"warnings":[],
+#  "goodness_of_fit":{"r_squared":0.9997,"sse":...,"rmse":...,
+#                     "residual_standard_error":...,"max_abs_residual":...,
+#                     "identifiability_collinearity":0.82},
+#  "initial_guess":{"vmax":...,"km":...}}
+```
+
+拟合质量：`goodness_of_fit` 给出决定系数 `r_squared`、残差平方和 `sse`、
+`rmse`、回归残差标准误、最大绝对残差，以及最优处 Vmax/Km 两列 Jacobian 的
+相关性 `identifiability_collinearity`（越接近 1 越不可辨识）。`reliable`
+综合可辨识性、R²、是否采到饱和段、有无 3σ 离群点给出总体可信度；`warnings`
+逐条说明 `narrow_substrate_range` / `no_saturation_observed` /
+`weak_parameter_identifiability` / `outlier_residual` / `poor_fit`。
+
+点名已登记酶时附加 `comparison`（不点名绝不对任何对象做对照）：
+
+```bash
+curl -XPOST localhost:8000/v1/rate/fit -H 'Content-Type: application/json' \
+  -d '{"enzyme":"hexokinase","measurements":[...]}'
+# 响应额外含: "enzyme":"hexokinase",
+#   "comparison":{"registered":{"vmax":100.0,"km":0.1},
+#                 "fitted":{"vmax":...,"km":...},
+#                 "absolute_deviation":{"vmax":...,"km":...},
+#                 "relative_deviation":{"vmax":...,"km":...}}
+```
+
+不可信情形如实拒绝（均带 `error` + `reason`，不硬吐数字）：
+
+* `422 insufficient_data`：测量点少于 3 个，不足以约束两个自由参数；
+* `422 fit_unidentifiable`：所有点底物浓度相同、速率全为零或全相同、或
+  数据全部挤在低 [S] 线性段导致 Vmax/Km 的 Jacobian 列近似共线；
+* `422 fit_did_not_converge`：所有初始起点在迭代上限内均未收敛；
+* `400 validation_error`：缺字段、非数字、NaN/Infinity、布尔、负数、
+  未知字段、非 JSON 对象、`max_iterations` 越界等；
+* `404 enzyme_not_found`：点名的酶未登记。
+
+### 4. 酶参数档管理（落地保存、重启后保留）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -129,3 +184,9 @@ pytest
 关键回归护栏：`[S]=Km ⇒ v=Vmax/2`；竞争性抑制下 `Vmax_app=Vmax` 与 LB 纵截距
 恒定；半饱和点随 `[I]` 右移；高底物下速率收敛到同一 `Vmax`；Vmax 加倍速率处处
 加倍；`Ki→∞` 连续退回米氏速率；真实 HTTP 并发互不串值、参数档重启后仍可取用。
+
+拟合方向（`tests/test_fitting.py`）的回归护栏：用"已知真实 Vmax/Km + 不同量级
+高斯噪声"的合成数据反推，噪声越小回收越准（多组种子/多噪声量级参数化）；
+精确数据 R²=1 且残差为零；`max_iterations=1` 必走非收敛路径并抛
+`FitConvergenceError`；少点、同底物重复、全零/恒定速率、深线性段共线全部拒绝；
+脏数据（负/NaN/Infinity/非数字/布尔）在拟合前挡回；跨数量级单位缩放不变性。

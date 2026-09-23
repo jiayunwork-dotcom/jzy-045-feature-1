@@ -136,6 +136,73 @@ def parse_inhibited_rate_request(payload: Any) -> dict[str, Any]:
     return base
 
 
+def parse_fit_request(payload: Any) -> dict[str, Any]:
+    """Validate an inverse-kinetics (Vmax/Km curve-fitting) request.
+
+    ``measurements`` is a non-empty list of ``{substrate, observed_rate}``
+    pairs.  An optional ``enzyme`` names a registered profile to compare the
+    fitted constants against; the comparison itself happens in the route.
+    """
+    payload = _require_object(payload)
+    allowed = frozenset({"measurements", "enzyme", "max_iterations"})
+    _reject_unknown(payload, allowed, "a kinetic fitting request")
+
+    if "measurements" not in payload:
+        raise ValidationError("missing required field 'measurements'")
+    measurements = payload["measurements"]
+    if not isinstance(measurements, list):
+        raise ValidationError("'measurements' must be a list")
+
+    points: list[dict[str, float]] = []
+    for index, item in enumerate(measurements):
+        where = f"measurement #{index}"
+        if not isinstance(item, Mapping):
+            raise ValidationError(f"{where} must be an object")
+        unknown = set(item) - {"substrate", "observed_rate"}
+        if unknown:
+            raise ValidationError(
+                f"{where}: unknown field(s): {', '.join(sorted(unknown))}"
+            )
+        if "substrate" not in item:
+            raise ValidationError(f"{where}: missing required field 'substrate'")
+        if "observed_rate" not in item:
+            raise ValidationError(
+                f"{where}: missing required field 'observed_rate'"
+            )
+        substrate = _number(item, "substrate")
+        observed_rate = _number(item, "observed_rate")
+        if substrate < 0.0:
+            raise ValidationError(
+                f"{where}: 'substrate' must be non-negative, got {substrate}"
+            )
+        if observed_rate < 0.0:
+            raise ValidationError(
+                f"{where}: 'observed_rate' must be non-negative, "
+                f"got {observed_rate}"
+            )
+        points.append({"substrate": substrate, "observed_rate": observed_rate})
+
+    result: dict[str, Any] = {"measurements": points}
+
+    if "enzyme" in payload:
+        enzyme = payload["enzyme"]
+        if not isinstance(enzyme, str) or not enzyme.strip():
+            raise ValidationError("'enzyme' must be a non-empty profile name")
+        result["enzyme"] = enzyme.strip()
+
+    if "max_iterations" in payload:
+        raw = payload["max_iterations"]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValidationError("'max_iterations' must be a positive integer")
+        if not 1 <= raw <= 10_000:
+            raise ValidationError(
+                "'max_iterations' must be within [1, 10000]"
+            )
+        result["max_iterations"] = raw
+
+    return result
+
+
 def validate_profile_name(name: Any) -> str:
     """Validate a URL/body enzyme profile name."""
     if not isinstance(name, str) or not name.strip():

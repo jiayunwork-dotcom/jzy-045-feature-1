@@ -7,6 +7,7 @@ import pytest
 from app.inhibition import COMPETITIVE
 from app.validation import (
     ValidationError,
+    parse_fit_request,
     parse_inhibited_rate_request,
     parse_profile_payload,
     parse_rate_request,
@@ -180,3 +181,97 @@ def test_validate_profile_name():
         validate_profile_name(5)
     with pytest.raises(ValidationError):
         validate_profile_name("x" * 129)
+
+
+# ---------------------------------------------------------------------- /fit
+def test_fit_request_parses_measurements():
+    req = parse_fit_request({"measurements": [
+        {"substrate": 0.1, "observed_rate": 50},
+        {"substrate": 1, "observed_rate": 90.9},
+    ]})
+    assert req["measurements"] == [
+        {"substrate": 0.1, "observed_rate": 50.0},
+        {"substrate": 1.0, "observed_rate": 90.9},
+    ]
+    assert "enzyme" not in req
+
+
+def test_fit_request_accepts_enzyme_and_iteration_cap():
+    req = parse_fit_request({"measurements": [
+        {"substrate": 1, "observed_rate": 2},
+        {"substrate": 3, "observed_rate": 4},
+        {"substrate": 5, "observed_rate": 6},
+    ], "enzyme": "  hexokinase ", "max_iterations": 25})
+    assert req["enzyme"] == "hexokinase"
+    assert req["max_iterations"] == 25
+
+
+def test_fit_request_requires_measurements():
+    with pytest.raises(ValidationError, match="measurements"):
+        parse_fit_request({})
+
+
+def test_fit_request_measurements_must_be_list():
+    with pytest.raises(ValidationError):
+        parse_fit_request({"measurements": {"substrate": 1, "observed_rate": 2}})
+
+
+@pytest.mark.parametrize("payload", [
+    {"measurements": [{"substrate": -1, "observed_rate": 2},
+                      {"substrate": 3, "observed_rate": 4},
+                      {"substrate": 5, "observed_rate": 6}]},
+    {"measurements": [{"substrate": 1, "observed_rate": -2},
+                      {"substrate": 3, "observed_rate": 4},
+                      {"substrate": 5, "observed_rate": 6}]},
+    {"measurements": [{"substrate": "x", "observed_rate": 4},
+                      {"substrate": 3, "observed_rate": 4},
+                      {"substrate": 5, "observed_rate": 6}]},
+    {"measurements": [{"substrate": 1, "observed_rate": float("inf")},
+                      {"substrate": 3, "observed_rate": 4},
+                      {"substrate": 5, "observed_rate": 6}]},
+])
+def test_fit_request_dirty_points_rejected(payload):
+    with pytest.raises(ValidationError):
+        parse_fit_request(payload)
+
+
+def test_fit_request_point_missing_fields_rejected():
+    with pytest.raises(ValidationError, match="observed_rate"):
+        parse_fit_request({"measurements": [
+            {"substrate": 1},
+            {"substrate": 3, "observed_rate": 4},
+            {"substrate": 5, "observed_rate": 6},
+        ]})
+
+
+def test_fit_request_unknown_fields_rejected_top_level_and_point():
+    with pytest.raises(ValidationError, match="unknown"):
+        parse_fit_request({"measurements": [
+            {"substrate": 1, "observed_rate": 2},
+            {"substrate": 3, "observed_rate": 4},
+        ], "weights": []})
+    with pytest.raises(ValidationError, match="unknown"):
+        parse_fit_request({"measurements": [
+            {"substrate": 1, "observed_rate": 2, "residual_weight": 1},
+            {"substrate": 3, "observed_rate": 4},
+        ]})
+
+
+@pytest.mark.parametrize("cap", [0, -1, 10001, 1.5, True, "10", 1.0])
+def test_fit_request_bad_iteration_cap_rejected(cap):
+    payload = {"measurements": [
+        {"substrate": 1, "observed_rate": 2},
+        {"substrate": 3, "observed_rate": 4},
+        {"substrate": 5, "observed_rate": 6},
+    ], "max_iterations": cap}
+    with pytest.raises(ValidationError):
+        parse_fit_request(payload)
+
+
+def test_fit_request_blank_enzyme_rejected():
+    with pytest.raises(ValidationError, match="enzyme"):
+        parse_fit_request({"measurements": [
+            {"substrate": 1, "observed_rate": 2},
+            {"substrate": 3, "observed_rate": 4},
+            {"substrate": 5, "observed_rate": 6},
+        ], "enzyme": "   "})

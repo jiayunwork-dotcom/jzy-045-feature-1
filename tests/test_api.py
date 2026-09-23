@@ -226,3 +226,245 @@ def test_unknown_endpoint_returns_json_404(client):
     resp = client.get("/nope")
     assert resp.status_code == 404
     assert resp.get_json()["error"] == "not_found"
+
+
+# ------------------------------------------------------------- /v1/rate/fit
+def _fit_body(points, **extra):
+    body = {
+        "measurements": [
+            {"substrate": s, "observed_rate": v} for s, v in points
+        ],
+    }
+    body.update(extra)
+    return body
+
+
+def _hexokinase_points():
+    # Vmax=100, Km=0.1 with light deterministic-ish scatter.
+    raw = [
+        (0.01, 9.0), (0.02, 16.8), (0.04, 28.8), (0.07, 41.0),
+        (0.1, 50.3), (0.15, 59.7), (0.25, 71.2), (0.4, 80.1),
+        (0.7, 87.7), (1.0, 90.7),
+    ]
+    return raw
+
+
+def test_fit_recovers_hexokinase_constants_without_enzyme_name(client):
+    resp = client.post("/v1/rate/fit", json=_fit_body(_hexokinase_points()))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["vmax"] == pytest.approx(100.0, rel=0.02)
+    assert body["km"] == pytest.approx(0.1, rel=0.05)
+    assert body["converged"] is True
+    assert body["iterations"] >= 1
+    assert body["n_points"] == 10
+    assert body["reliable"] is True
+    assert "enzyme" not in body
+    assert "comparison" not in body  # unnamed: no comparison is ever attached
+    gof = body["goodness_of_fit"]
+    assert gof["r_squared"] > 0.99
+    assert gof["sse"] >= 0.0
+    assert gof["rmse"] == pytest.approx((gof["sse"] / 10) ** 0.5)
+    assert 0.0 <= gof["identifiability_collinearity"] < 1.0
+    assert body["initial_guess"]["vmax"] > 0
+    assert body["initial_guess"]["km"] > 0
+
+
+def test_fit_exact_noise_free_data_is_perfect(client):
+    points = [(s, 100 * s / (s + 0.1))
+              for s in (0.01, 0.03, 0.1, 0.3, 1.0, 3.0)]
+    resp = client.post("/v1/rate/fit", json=_fit_body(points))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["vmax"] == pytest.approx(100.0, rel=1e-7)
+    assert body["km"] == pytest.approx(0.1, rel=1e-7)
+    assert body["goodness_of_fit"]["r_squared"] == pytest.approx(1.0, abs=1e-10)
+    assert body["warnings"] == []
+
+
+def test_fit_with_named_enzyme_attaches_comparison(client):
+    points = [(s, 110 * s / (s + 0.12))
+              for s in (0.01, 0.03, 0.1, 0.3, 1.0, 3.0)]
+    resp = client.post(
+        "/v1/rate/fit", json=_fit_body(points, enzyme="hexokinase")
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enzyme"] == "hexokinase"
+    comparison = body["comparison"]
+    assert comparison["registered"] == {"vmax": 100.0, "km": 0.1}
+    assert comparison["fitted"]["vmax"] == pytest.approx(110.0, rel=1e-6)
+    assert comparison["fitted"]["km"] == pytest.approx(0.12, rel=1e-6)
+    assert comparison["relative_deviation"]["vmax"] == pytest.approx(0.1, rel=1e-5)
+    assert comparison["relative_deviation"]["km"] == pytest.approx(0.2, rel=1e-5)
+
+
+def test_fit_unknown_enzyme_returns_404(client):
+    points = _hexokinase_points()
+    resp = client.post(
+        "/v1/rate/fit", json=_fit_body(points, enzyme="ghostase")
+    )
+    assert resp.status_code == 404
+    err = resp.get_json()
+    assert err["error"] == "enzyme_not_found"
+    assert "ghostase" in err["reason"]
+
+
+def test_fit_works_against_a_freshly_registered_profile(client):
+    client.put("/v1/enzymes/catalase",
+               json={"vmax": 55, "km": 0.4, "description": "demo"})
+    points = [(s, 55 * s / (s + 0.4))
+              for s in (0.05, 0.2, 0.4, 1.0, 4.0)]
+    resp = client.post(
+        "/v1/rate/fit", json=_fit_body(points, enzyme="catalase")
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["vmax"] == pytest.approx(55.0, rel=1e-6)
+    assert body["km"] == pytest.approx(0.4, rel=1e-6)
+    assert body["comparison"]["relative_deviation"]["vmax"] == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+def test_fit_too_few_points_returns_422(client):
+    for points in ([], [(1.0, 0.5)], [(1.0, 0.5), (2.0, 0.8)]):
+        resp = client.post("/v1/rate/fit", json=_fit_body(points))
+        assert resp.status_code == 422
+        err = resp.get_json()
+        assert err["error"] == "insufficient_data"
+        assert err["reason"]
+
+
+def test_fit_identical_substrates_returns_422(client):
+    points = [(0.1, 10.0), (0.1, 11.0), (0.1, 9.5), (0.1, 10.4)]
+    resp = client.post("/v1/rate/fit", json=_fit_body(points))
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "fit_unidentifiable"
+
+
+def test_fit_zero_or_constant_rates_returns_422(client):
+    resp = client.post(
+        "/v1/rate/fit",
+        json=_fit_body([(1, 0), (2, 0), (3, 0)]),
+    )
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "fit_unidentifiable"
+
+    resp = client.post(
+        "/v1/rate/fit",
+        json=_fit_body([(1, 5), (2, 5), (3, 5), (4, 5)]),
+    )
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "fit_unidentifiable"
+
+
+def test_fit_negative_and_non_finite_measurements_return_400(client):
+    bad_bodies = [
+        _fit_body([(-1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]),
+        _fit_body([(1.0, -0.5), (2.0, 2.0), (3.0, 3.0)]),
+        _fit_body([(1.0, float("nan")), (2.0, 2.0), (3.0, 3.0)]),
+        _fit_body([(float("inf"), 1.0), (2.0, 2.0), (3.0, 3.0)]),
+        _fit_body([(1.0, 1.0), (2.0, "x"), (3.0, 3.0)]),
+    ]
+    for body in bad_bodies:
+        resp = client.post("/v1/rate/fit", json=body)
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "validation_error"
+
+
+def test_fit_rejects_malformed_measurement_shapes(client):
+    for measurements in (
+        None,
+        [],
+        [{"substrate": 1.0}, {"substrate": 2.0, "observed_rate": 2.0},
+            {"substrate": 3.0, "observed_rate": 3.0}],
+        [{"substrate": 1.0, "observed_rate": 1.0, "extra": 9}],
+        "not-a-list",
+        [42, 43, 44],
+    ):
+        resp = client.post("/v1/rate/fit", json={"measurements": measurements})
+        assert resp.status_code in (400, 422), measurements
+
+
+def test_fit_rejects_unknown_top_level_fields(client):
+    body = _fit_body(_hexokinase_points())
+    body["method"] = "linear"
+    resp = client.post("/v1/rate/fit", json=body)
+    assert resp.status_code == 400
+    assert "unknown field" in resp.get_json()["reason"]
+
+
+def test_fit_non_json_body_rejected(client):
+    resp = client.post("/v1/rate/fit", data="nope",
+                       content_type="application/json")
+    assert resp.status_code == 400
+
+
+def test_fit_iteration_cap_returns_422_not_a_guess(client):
+    points = _hexokinase_points()
+    resp = client.post(
+        "/v1/rate/fit", json=_fit_body(points, max_iterations=1)
+    )
+    assert resp.status_code == 422
+    err = resp.get_json()
+    assert err["error"] == "fit_did_not_converge"
+    assert "converge" in err["reason"]
+    # No parameters leak out of a failed fit.
+    assert "vmax" not in err and "km" not in err
+
+
+def test_fit_invalid_iteration_cap_returns_400(client):
+    points = _hexokinase_points()
+    for cap in (0, -5, 10001, 1.5, True, "10"):
+        resp = client.post(
+            "/v1/rate/fit", json=_fit_body(points, max_iterations=cap)
+        )
+        assert resp.status_code == 400, cap
+
+
+def test_fit_unreliable_data_still_reports_warnings_with_200(client):
+    # Rates decreasing with [S] contradict the Michaelis curve; the solver
+    # converges (a best-of-bad answer exists) but flags it as unreliable.
+    points = [(0.1, 90.0), (0.2, 60.0), (0.4, 40.0), (0.8, 25.0), (1.6, 15.0)]
+    resp = client.post("/v1/rate/fit", json=_fit_body(points))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["converged"] is True
+    assert body["reliable"] is False
+    codes = {w["code"] for w in body["warnings"]}
+    assert "poor_fit" in codes
+    assert all(w["message"] for w in body["warnings"])
+    assert body["goodness_of_fit"]["r_squared"] < 0.8
+
+
+def test_fit_deep_linear_limb_data_refused_as_unidentifiable(client):
+    # Points only on the deep linear low-[S] limb cannot separate Vmax from
+    # Km; the endpoint refuses rather than returning a meaningless pair.
+    points = [(s, 100 * s / (s + 0.1)) for s in (0.001, 0.0013, 0.002)]
+    resp = client.post("/v1/rate/fit", json=_fit_body(points))
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "fit_unidentifiable"
+
+
+def test_fit_weak_but_not_degenerate_data_warns_with_200(client):
+    # A 9-fold window reaching ~30% of Vmax still barely curves: the solver
+    # converges (and exact data fit exactly) but the result must not be
+    # presented as reliable.
+    points = [(s, 100 * s / (s + 0.1))
+              for s in (0.005, 0.01, 0.02, 0.03, 0.045)]
+    resp = client.post("/v1/rate/fit", json=_fit_body(points))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["reliable"] is False
+    codes = {w["code"] for w in body["warnings"]}
+    assert "weak_parameter_identifiability" in codes
+    assert "no_saturation_observed" in codes
+
+
+def test_fit_does_not_touch_rate_endpoint_contract(client):
+    # The forward endpoint still works exactly as before alongside the new one.
+    resp = client.post("/v1/rate",
+                       json={"vmax": 100, "km": 0.1, "substrate": 0.1})
+    assert resp.status_code == 200
+    assert resp.get_json()["rate"] == pytest.approx(50.0)
