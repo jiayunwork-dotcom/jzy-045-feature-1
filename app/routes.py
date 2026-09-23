@@ -6,10 +6,12 @@ from flask import Blueprint, current_app, jsonify, request
 
 from .enzyme_store import EnzymeNotFoundError, EnzymeProfile
 from .errors import json_error
+from .fitting import FitError, compare_to_profile, fit_michaelis_menten
 from .inhibition import competitive_rate
 from .kinetics import michaelis_rate
 from .validation import (
     ValidationError,
+    parse_fit_request,
     parse_inhibited_rate_request,
     parse_profile_payload,
     parse_rate_request,
@@ -106,6 +108,75 @@ def calculate_inhibited_rate():
     }
     if enzyme is not None:
         body["enzyme"] = enzyme
+    return jsonify(body)
+
+
+# ------------------------------------------------------------ inverse problem
+@api.post("/fit")
+def fit_kinetics():
+    """Estimate Vmax and Km from (substrate, observed_rate) measurements.
+
+    Body: {"measurements": [{"substrate", "observed_rate"}, ...],
+           "enzyme": optional registered profile name for comparison}.
+    """
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return json_error(400, "bad_request", "request body must be valid JSON")
+    try:
+        req = parse_fit_request(payload)
+        enzyme = req.get("enzyme")
+        # Resolve the referenced profile the same way the rate endpoints do,
+        # before spending work on the fit: a misspelled name is a 404, not a
+        # 422. Comparison itself only happens because a name was given.
+        reference = _store().get(enzyme) if enzyme is not None else None
+        points = [
+            (m["substrate"], m["observed_rate"]) for m in req["measurements"]
+        ]
+        result = fit_michaelis_menten(points)
+    except ValidationError as exc:
+        return json_error(400, "validation_error", str(exc))
+    except EnzymeNotFoundError as exc:
+        return json_error(
+            404, "enzyme_not_found", f"no enzyme registered as {exc.args[0]!r}"
+        )
+    except FitError as exc:
+        # Malformed shape is 400; structurally valid data that yields no
+        # trustworthy estimate is 422 with a machine-readable reason code.
+        return json_error(422, exc.code, str(exc))
+
+    body = {
+        "converged": True,
+        "vmax": result.vmax,
+        "km": result.km,
+        "n_points": result.n_points,
+        "goodness_of_fit": {
+            "r_squared": result.r_squared,
+            "adjusted_r_squared": result.adjusted_r_squared,
+            "residual_sum_squares": result.residual_sum_squares,
+            "rmse": result.rmse,
+            "residual_standard_error": result.residual_standard_error,
+        },
+        "standard_errors": {
+            "vmax": result.vmax_standard_error,
+            "km": result.km_standard_error,
+            "vmax_relative": result.vmax_relative_standard_error,
+            "km_relative": result.km_relative_standard_error,
+        },
+        "optimization": {
+            "iterations": result.iterations,
+            "starts_tried": result.starts_tried,
+            "initial_vmax": result.initial_vmax,
+            "initial_km": result.initial_km,
+        },
+    }
+
+    if enzyme is not None:
+        assert reference is not None
+        comparison = compare_to_profile(
+            result.vmax, result.km,
+            reference.vmax, reference.km, enzyme,
+        )
+        body["profile_comparison"] = comparison.to_json()
     return jsonify(body)
 
 

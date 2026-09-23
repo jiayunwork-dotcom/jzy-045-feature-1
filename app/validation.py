@@ -136,6 +136,68 @@ def parse_inhibited_rate_request(payload: Any) -> dict[str, Any]:
     return base
 
 
+def parse_fit_request(payload: Any) -> dict[str, Any]:
+    """Validate an inverse-problem (parameter fitting) request.
+
+    Shape::
+
+        {"measurements": [{"substrate": s, "observed_rate": v}, ...],
+         "enzyme": "optional registered profile name for comparison"}
+
+    Semantic sufficiency (point count, distinct substrates, fit quality) is
+    checked later by the fitting core; this function owns request shape and
+    per-record numeric validity, the same split used by the other parsers.
+    """
+    payload = _require_object(payload)
+    allowed = frozenset({"measurements", "enzyme"})
+    _reject_unknown(payload, allowed, "a fitting request")
+
+    if "measurements" not in payload:
+        raise ValidationError("missing required field 'measurements'")
+    raw = payload["measurements"]
+    if not isinstance(raw, list):
+        raise ValidationError("'measurements' must be a list of measurement objects")
+    if not raw:
+        raise ValidationError("'measurements' must contain at least one record")
+
+    record_allowed = frozenset({"substrate", "observed_rate"})
+    measurements: list[dict[str, float]] = []
+    for index, record in enumerate(raw):
+        where = f"measurements[{index}]"
+        if not isinstance(record, Mapping):
+            raise ValidationError(f"{where} must be a JSON object")
+        unknown = set(record) - record_allowed
+        if unknown:
+            raise ValidationError(
+                f"unknown field(s) for {where}: {', '.join(sorted(unknown))}"
+            )
+        if "substrate" not in record:
+            raise ValidationError(f"{where} missing required field 'substrate'")
+        if "observed_rate" not in record:
+            raise ValidationError(f"{where} missing required field 'observed_rate'")
+        substrate = _number(record, "substrate")
+        observed_rate = _number(record, "observed_rate")
+        if substrate < 0.0:
+            raise ValidationError(
+                f"{where}.substrate must be non-negative, got {substrate}"
+            )
+        if observed_rate < 0.0:
+            raise ValidationError(
+                f"{where}.observed_rate must be non-negative, got {observed_rate}"
+            )
+        measurements.append(
+            {"substrate": substrate, "observed_rate": observed_rate}
+        )
+
+    result: dict[str, Any] = {"measurements": measurements}
+    if "enzyme" in payload:
+        enzyme = payload["enzyme"]
+        if not isinstance(enzyme, str) or not enzyme.strip():
+            raise ValidationError("'enzyme' must be a non-empty profile name")
+        result["enzyme"] = enzyme.strip()
+    return result
+
+
 def validate_profile_name(name: Any) -> str:
     """Validate a URL/body enzyme profile name."""
     if not isinstance(name, str) or not name.strip():

@@ -7,6 +7,7 @@ import pytest
 from app.inhibition import COMPETITIVE
 from app.validation import (
     ValidationError,
+    parse_fit_request,
     parse_inhibited_rate_request,
     parse_profile_payload,
     parse_rate_request,
@@ -149,6 +150,112 @@ def test_zero_inhibitor_with_competitive_is_valid():
          "ki": 1.0, "inhibition_type": "competitive"}
     )
     assert req["inhibitor"] == 0.0
+
+
+# ------------------------------------------------------------------------ /fit
+def _fit_body(*extra):
+    return {"measurements": [
+        {"substrate": 0.1, "observed_rate": 50.0},
+        {"substrate": 0.2, "observed_rate": 66.7},
+        {"substrate": 0.5, "observed_rate": 83.3},
+    ]}
+
+
+def test_fit_request_parses_measurements():
+    req = parse_fit_request(_fit_body())
+    assert req["measurements"] == [
+        {"substrate": 0.1, "observed_rate": 50.0},
+        {"substrate": 0.2, "observed_rate": 66.7},
+        {"substrate": 0.5, "observed_rate": 83.3},
+    ]
+    assert "enzyme" not in req
+
+
+def test_fit_request_accepts_optional_enzyme():
+    req = parse_fit_request({**_fit_body(), "enzyme": " hexokinase "})
+    assert req["enzyme"] == "hexokinase"
+
+
+def test_fit_request_requires_measurements():
+    with pytest.raises(ValidationError, match="measurements"):
+        parse_fit_request({"enzyme": "x"})
+
+
+def test_fit_request_measurements_must_be_list():
+    with pytest.raises(ValidationError):
+        parse_fit_request({"measurements": {"substrate": 1, "observed_rate": 2}})
+
+
+def test_fit_request_rejects_empty_measurements():
+    with pytest.raises(ValidationError):
+        parse_fit_request({"measurements": []})
+
+
+@pytest.mark.parametrize("record", [
+    {"substrate": 0.1},
+    {"observed_rate": 50.0},
+    {"substrate": 0.1, "observed_rate": 50.0, "bogus": 1},
+    [0.1, 50.0],
+    "0.1,50",
+])
+def test_fit_request_rejects_bad_records(record):
+    with pytest.raises(ValidationError):
+        parse_fit_request({"measurements": [
+            {"substrate": 0.2, "observed_rate": 60.0}, record,
+            {"substrate": 0.5, "observed_rate": 80.0},
+        ]})
+
+
+def test_fit_record_error_is_indexed():
+    with pytest.raises(ValidationError, match=r"measurements\[1\]"):
+        parse_fit_request({"measurements": [
+            {"substrate": 0.2, "observed_rate": 60.0},
+            {"substrate": -0.1, "observed_rate": 50.0},
+            {"substrate": 0.5, "observed_rate": 80.0},
+        ]})
+
+
+@pytest.mark.parametrize("bad", [
+    {"substrate": -0.1, "observed_rate": 1.0},
+    {"substrate": 0.1, "observed_rate": -1.0},
+    {"substrate": float("nan"), "observed_rate": 1.0},
+    {"substrate": 0.1, "observed_rate": float("inf")},
+    {"substrate": True, "observed_rate": 1.0},
+    {"substrate": 0.1, "observed_rate": "fast"},
+    {"substrate": None, "observed_rate": 1.0},
+])
+def test_fit_request_rejects_non_finite_or_negative_values(bad):
+    with pytest.raises(ValidationError):
+        parse_fit_request({"measurements": [
+            {"substrate": 0.2, "observed_rate": 60.0}, bad,
+            {"substrate": 0.5, "observed_rate": 80.0},
+        ]})
+
+
+def test_fit_request_zero_substrate_and_zero_rate_are_legal():
+    req = parse_fit_request({"measurements": [
+        {"substrate": 0.0, "observed_rate": 0.0},
+        {"substrate": 0.2, "observed_rate": 60.0},
+        {"substrate": 0.5, "observed_rate": 80.0},
+    ]})
+    assert req["measurements"][0] == {"substrate": 0.0, "observed_rate": 0.0}
+
+
+def test_fit_request_unknown_top_level_field_rejected():
+    with pytest.raises(ValidationError, match="unknown field"):
+        parse_fit_request({**_fit_body(), "vmax": 1.0})
+
+
+def test_fit_request_enzyme_must_be_non_empty_string():
+    with pytest.raises(ValidationError):
+        parse_fit_request({**_fit_body(), "enzyme": ""})
+    with pytest.raises(ValidationError):
+        parse_fit_request({**_fit_body(), "enzyme": 9})
+
+
+def test_fit_request_non_object_body_rejected():
+    with pytest.raises(ValidationError):
+        parse_fit_request([{"substrate": 1, "observed_rate": 2}])
 
 
 # ------------------------------------------------------------------ profiles
